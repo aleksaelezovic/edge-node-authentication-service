@@ -95,7 +95,8 @@ async function getSafeUser(user) {
     const { password, ...safeUser } = user.dataValues;
     safeUser.config = await user.config();
     const userAuthEnabled = safeUser.config.some(c => c.option === 'auth_enabled' && c.value === 'true');
-    return AUTH_ENABLED || !userAuthEnabled ? safeUser : null;
+    if (!AUTH_ENABLED && userAuthEnabled) return null;
+    return safeUser;
 }
 
 app.get('/auth/check', async (req, res, next) => {
