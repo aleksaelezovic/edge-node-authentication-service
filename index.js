@@ -26,6 +26,7 @@ const corsOptions = {
         }
     },
     credentials: true, // Allow credentials (cookies, authorization headers, etc.)
+    exposedHeaders: ['X-AUTH-ENABLED'],
 };
 
 
@@ -87,44 +88,62 @@ passport.use(new JwtStrategy(opts, (jwtPayload, done) => {
         .catch(err => done(err, false));
 }));
 
-function isBooleanString(str) {
-    if (str.toLowerCase() === 'true') {
-        return true;
-    } else if (str.toLowerCase() === 'false') {
-        return false;
-    } else {
-        return null; // or handle cases where the string is not a boolean value
-    }
+const AUTH_ENABLED = process.env.AUTH_ENABLED !== 'false';
+
+async function getSafeUser(user) {
+    if (!user) return null;
+    const { password, ...safeUser } = user.dataValues;
+    safeUser.config = await user.config();
+    const userAuthEnabled = safeUser.config.some(c => c.option === 'auth_enabled' && c.value === 'true');
+    return AUTH_ENABLED || !userAuthEnabled ? safeUser : null;
 }
 
 app.get('/auth/check', async (req, res, next) => {
-    let isAuthEnabled;
-    const authEnabledConfig = await UserConfig.findOne({
-        where: {
-            option: 'auth_enabled'
+    res.setHeader("X-AUTH-ENABLED", String(AUTH_ENABLED));
+
+    if (!AUTH_ENABLED || !req.session.anonymous) {
+        const user = req.isAuthenticated()
+            ? await User.findOne({ where: { username: req.user.username } })
+            : AUTH_ENABLED
+                ? null
+                : await User.findOne({
+                    include: [{
+                        model: UserConfig,
+                        as: 'configs',
+                        where: {
+                            option: 'auth_enabled',
+                            [Op.and]: { value: 'false' }
+                        }
+                    }]
+                });
+
+        if (!user) {
+            if (AUTH_ENABLED) return res.json({ authenticated: false, user: null });
+            throw new Error("Auth service configured with AUTH_ENABLED=false but there is no user with userConfig option 'auth_enabled' set to 'false'.");
         }
-    });
-    isAuthEnabled = (authEnabledConfig) ? isBooleanString(authEnabledConfig.value) : true;
 
-    if(!isAuthEnabled) {
-        let user = {};
-        user.config = await UserConfig.findAll({
-            where: {
-                option: {
-                    [Op.in]: PUBLIC_PROPERTIES
-                }
-            }
+        // Login the user with 'auth_enabled' = 'false'
+        // This is required becuase some services check for session cookie!
+        if (!AUTH_ENABLED) await new Promise((r) => req.login(user, err =>{
+            if (err) return next(err);
+            req.session.anonymous = true;
+            r();
+        }));
+
+        const safeUser = await getSafeUser(user);
+        if (safeUser) return res.json({ authenticated: true, user: safeUser });
+    }
+
+    req.logout((err) => {
+        if (err) return next(err);
+        req.session.destroy((err) => {
+            if (err) return next(err);
+
+            res.clearCookie('connect.sid');
+            res.json({ authenticated: false, user: null });
         });
-        return res.json({ authenticated: false, user: user });
-    }
+    });
 
-    if (req.isAuthenticated()) {
-        const user = await User.findOne({ where: { username: req.user.username } });
-        const { password, ...safeUser } = user.dataValues;
-        safeUser.config = await user.config();
-        return res.json({ authenticated: true, user: safeUser });
-    }
-    return res.json({ authenticated: false, user: null });
     // passport.authenticate('jwt', { session: false }, (err, user, info) => {
     //     if (err) return next(err);
     //     if (!user) return res.status(401).json({ authenticated: false });
